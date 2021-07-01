@@ -20,8 +20,12 @@ class TLDetector(object):
 
         self.pose = None
         self.waypoints = None
+        self.waypoints_2d = None
+        self.waypoints_tree = None
         self.camera_image = None
         self.lights = []
+        
+        self.tlstate = {TrafficLight.RED : "RED", TrafficLight.YELLOW : "YELLOW", TrafficLight.GREEN : "GREEN", TrafficLight.UNKNOWN : "UNKNOWN"}
 
         sub1 = rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
         sub2 = rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
@@ -38,11 +42,12 @@ class TLDetector(object):
 
         config_string = rospy.get_param("/traffic_light_config")
         self.config = yaml.load(config_string)
+        #self.is_site = self.config("is_site")
 
         self.upcoming_red_light_pub = rospy.Publisher('/traffic_waypoint', Int32, queue_size=1)
 
         self.bridge = CvBridge()
-        self.light_classifier = TLClassifier()
+        self.light_classifier = TLClassifier(self.is_site)
         self.listener = tf.TransformListener()
 
         self.state = TrafficLight.UNKNOWN
@@ -50,7 +55,28 @@ class TLDetector(object):
         self.last_wp = -1
         self.state_count = 0
 
-        rospy.spin()
+        #rospy.spin()
+        self.ros_spin()
+        
+    def ros_spin(self):
+        rate = rospy.Rate(20)
+        while not rospy.is_shutdown():
+            if self.camera_image is not None and self.waypoints is not None:
+                light_wp, state = self.process_traffic_lights()
+                
+                if self.state != state:
+                    self.state_count = 0
+                    self.state = state
+                elif self.state_count >= 3:
+                    self.last_state = self.state
+                    light_wp = light_wp if state == TrafficLight.RED else -1
+                    self.last_wp = light_wp
+                    self.upcoming_red_light_pub.publish(Int32(light_wp))
+                else:
+                    self.upcoming_red_light_pub.publish(Int32(self.last_wp))
+                self.state_count += 1
+                
+            rate.sleep()
 
     def pose_cb(self, msg):
         self.pose = msg
