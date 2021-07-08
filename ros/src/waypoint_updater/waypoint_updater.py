@@ -1,32 +1,32 @@
 #!/usr/bin/env python
 
-from os import close
 import rospy
 from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import TwistStamped
 from styx_msgs.msg import Lane, Waypoint
-from scipy.spatial import KDTree
 from std_msgs.msg import Int32
-import numpy as np
 
 import math
+import sys
+import tf
+
+from kdtree import kdtree
+from hysteresis import hysteresis
 
 '''
 This node will publish waypoints from the car's current position to some `x` distance ahead.
-
 As mentioned in the doc, you should ideally first implement a version which does not care
 about traffic lights or obstacles.
-
 Once you have created dbw_node, you will update this node to use the status of traffic lights too.
-
 Please note that our simulator also provides the exact location of traffic lights and their
 current status in `/vehicle/traffic_lights` message. You can use this message to build this node
 as well as to verify your TL classifier.
-
 TODO (for Yousuf and Aaron): Stopline location for each traffic light.
 '''
 
-LOOKAHEAD_WPS = 200 # Number of waypoints we will publish. You can change this number
-MAX_DECEL = 1.0
+LOOKAHEAD_WPS = 70 # Number of waypoints we will publish. You can change this number
+MIN_ACCELERATION = -0.6
+SAFE_DIST = 1.
 
 
 class WaypointUpdater(object):
@@ -35,104 +35,96 @@ class WaypointUpdater(object):
 
         rospy.Subscriber('/current_pose', PoseStamped, self.pose_cb)
         rospy.Subscriber('/base_waypoints', Lane, self.waypoints_cb)
-        rospy.Subscriber('/traffic_waypoint', Int32, self.traffic_cb)
 
         # TODO: Add a subscriber for /traffic_waypoint and /obstacle_waypoint below
+        rospy.Subscriber('/traffic_waypoint', Int32, self.traffic_cb)
+        rospy.Subscriber('/current_velocity', TwistStamped, self.current_velocity_cb, queue_size=1)
 
         self.final_waypoints_pub = rospy.Publisher('final_waypoints', Lane, queue_size=1)
 
+        self.speed_limit = rospy.get_param('waypoint_loader/velocity', 40) / 3.6 # convert km/h to m/s
+
         # TODO: Add other member variables you need below
-        self.pose = None
-        self.base_waypoints = None
-        self.waypoints_2d = None
         self.waypoint_tree = None
-        self.base_lane = None
-        self.stopline_wp_idx = -1
+        self.waypoint_speeds = []
+        self.tf_listener = tf.TransformListener()
+        self.red_light_waypoint = None
+        self.next_waypoint = -1
+        self.current_speed = None
+        self.trajectory_target_speed = 0.0
+        self.trajectory_speed_hysteresis = hysteresis(2.0, 2.1, 0.0)
 
-        self.loop()
+        # Current pose
+        self.pose_stamped = None
 
-        #rospy.spin()
+        # Base waypoints
+        self.waypoints_stamped = None
 
-    def loop(self):
-        rate = rospy.Rate(50)
-        while not rospy.is_shutdown():
-            if self.pose and self.base_lane:
-                # Get closest waypoint
-                closest_waypoint_idx = self.get_closest_waypoint_idx()
-                self.publish_waypoints(closest_waypoint_idx)
-            rate.sleep()
-
-    def get_closest_waypoint_idx(self):
-        x = self.pose.pose.position.x
-        y = self.pose.pose.position.y
-        closest_idx = self.waypoint_tree.query([x,y], 1)[1]
-
-        # Check if closest is ahead of behind vehicle
-        closest_coord = self.waypoints_2d[closest_idx]
-        prev_coord = self.waypoints_2d[closest_idx-1]
-
-        # Equation for hyperplane through closest_coords
-        cl_vect = np.array(closest_coord)
-        prev_vect = np.array(prev_coord)
-        pos_vect = np.array([x,y])
-
-        val = np.dot(cl_vect-prev_vect, pos_vect-cl_vect)
-
-        if val > 0:
-            closest_idx = (closest_idx + 1) % len(self.waypoints_2d)
-        return closest_idx
-
-    def publish_waypoints(self, closest_idx):
-        final_lane = self.generate_lane()
-        self.final_waypoints_pub.publish(final_lane)
-
-    def generate_lane(self):
-        lane = Lane()
-
-        closest_idx = self.get_closest_waypoint_idx()
-        farthest_idx =  closest_idx + LOOKAHEAD_WPS
-        base_waypoints = self.base_lane.waypoints[closest_idx:farthest_idx]
-
-        if self.stopline_wp_idx == -1 or (self.stopline_wp_idx >= farthest_idx):
-            lane.waypoints = base_waypoints
-        else:
-            lane.waypoints = self.decelerate_waypoints(base_waypoints, closest_idx)
-
-        return lane
-
-    def decelerate_waypoints(self, waypoints, closest_idx):
-        temp = []
-        for i,wp in enumerate(waypoints):
-            p = Waypoint()
-            p.pose = wp.pose
-
-            stop_idx = max(self.stopline_wp_idx - closest_idx - 2, 0)
-            dist = self.distance(waypoints, i, stop_idx)
-            vel = math.sqrt(2 * MAX_DECEL * dist)
-            if vel < 1.:
-                vel = 0.
-
-            p.twist.twist.linear.x = min(vel, wp.twist.twist.linear.x)
-            temp.append(p)
-
-        return temp
+        rospy.spin()
 
     def pose_cb(self, msg):
-        self.pose = msg
+        self.pose_stamped = msg
+        # rospy.loginfo("waypoint_updater:pose_cb:self.pose_stamped %s", self.pose_stamped)
 
-    def waypoints_cb(self, waypoints):
-        self.base_lane = waypoints
-        self.base_waypoints = waypoints
-        if not self.waypoints_2d:
-            self.waypoints_2d = [[waypoint.pose.pose.position.x, waypoint.pose.pose.position.y] for waypoint in waypoints.waypoints]
-            self.waypoint_tree = KDTree(self.waypoints_2d)
+        # Do nothing until all messages have been recieved
+        if self.waypoints_stamped == None or self.red_light_waypoint == None or self.current_speed == None:
+            return
+
+        # Find the closest waypoint to the current pose
+        next_waypoint = self.get_closest_waypoint(self.pose_stamped.pose)
+
+        # The next waypoint should be ahead of the current pose.
+        # i.e. x co-ordinate of the next waypoint in car's reference frame should be positive
+        transformed_waypoint = self.transform_to_car_frame(self.waypoints_stamped.waypoints[next_waypoint].pose)
+
+        if transformed_waypoint != None and transformed_waypoint.pose.position.x <= 0.0:
+            next_waypoint += 1
+
+        num_waypoints = len(self.waypoints_stamped.waypoints)
+
+        if next_waypoint >= num_waypoints:
+            next_waypoint -= num_waypoints
+
+        # Calculate a trajectory
+        self.calculate_trajectory(next_waypoint)
+
+        # Construct the set of subsequent waypoints
+        next_wps = [None] * LOOKAHEAD_WPS
+
+        for _wp, wp in enumerate(range(next_waypoint, next_waypoint + LOOKAHEAD_WPS)):
+            wp_index = wp if (wp < num_waypoints) else (wp - num_waypoints)
+            next_wps[_wp] = self.waypoints_stamped.waypoints[wp_index]
+            self.set_waypoint_velocity(next_wps, _wp, min(self.waypoint_speeds[wp_index], self.get_trajectory_speed_at_waypoint(_wp)))
+
+        # Construct final_waypoints message
+        lane = Lane()
+        lane.waypoints = next_wps
+        lane.header.frame_id = self.waypoints_stamped.header.frame_id
+        lane.header.stamp = rospy.Time(0)
+
+        self.final_waypoints_pub.publish(lane)
+
+    def waypoints_cb(self, msg):
+        if self.waypoints_stamped != None:
+            return
+
+        self.waypoints_stamped = msg
+
+        for i in range(len(self.waypoints_stamped.waypoints)):
+            self.waypoints_stamped.waypoints[i].pose.header.frame_id = self.waypoints_stamped.header.frame_id
+            self.waypoint_speeds.append(self.speed_limit) # TODO: use actual waypoint speeds
+
+        self.waypoint_tree = kdtree([(waypoint.pose.pose.position.x, waypoint.pose.pose.position.y) for waypoint in self.waypoints_stamped.waypoints], 2)
 
     def traffic_cb(self, msg):
-        self.stopline_wp_idx = msg.data
+        self.red_light_waypoint = msg.data
 
     def obstacle_cb(self, msg):
         # TODO: Callback for /obstacle_waypoint message. We will implement it later
         pass
+
+    def current_velocity_cb(self, msg):
+        self.current_speed = msg.twist.linear.x
 
     def get_waypoint_velocity(self, waypoint):
         return waypoint.twist.twist.linear.x
@@ -147,6 +139,83 @@ class WaypointUpdater(object):
             dist += dl(waypoints[wp1].pose.pose.position, waypoints[i].pose.pose.position)
             wp1 = i
         return dist
+
+    def distance2(self, pose1, pose2):
+        """Calculate the square of the Eucleadian distance bentween the two poses given
+        Args:
+            pose1: given Pose
+            pose2: given Pose
+        Returns:
+            float: square of the Eucleadian distance bentween the two poses given
+        """
+        dist2 = (pose1.position.x-pose2.position.x)**2 + (pose1.position.y-pose2.position.y)**2
+        return dist2
+
+    def get_closest_waypoint(self, pose):
+        """Identifies the closest path waypoint to the given position
+            https://en.wikipedia.org/wiki/Closest_pair_of_points_problem
+        Args:
+            pose (Pose): position to match a waypoint to
+        Returns:
+            int: index of the closest waypoint in self.waypoints
+        """
+        if self.waypoint_tree == None:
+            return None
+
+        return self.waypoint_tree.closest((pose.position.x, pose.position.y))[0]
+
+    def transform_to_car_frame(self, pose_stamped):
+        """Transform the given pose to car co-ordinate frame
+        Args:
+            pose: given PoseStamped object
+        Returns:
+            PoseStamped: a PoseStamped object which is car co-ordinate frame equivalent
+                  of the given pose. (None if the tranformation failed)
+        """
+        try:
+            self.tf_listener.waitForTransform("base_link", "world", rospy.Time(0), rospy.Duration(0.02))
+            transformed_pose_stamped = self.tf_listener.transformPose("base_link", pose_stamped)
+        except (tf.Exception, tf.LookupException, tf.ConnectivityException):
+            try:
+                self.tf_listener.waitForTransform("base_link", "world", rospy.Time(0), rospy.Duration(1.0))
+                transformed_pose_stamped = self.tf_listener.transformPose("base_link", pose_stamped)
+            except (tf.Exception, tf.LookupException, tf.ConnectivityException):
+                transformed_pose_stamped = None
+                rospy.logwarn("Failed to transform pose")
+
+        return transformed_pose_stamped
+
+    def calculate_trajectory(self, next_waypoint):
+        """Calculate a trajectory starting at the given waypoint so that the car
+           comes to a halt at the next stopline in case of a red light and
+           travels at speed limit otherwise
+        Args:
+            next_waypoint: index of the next waypoint
+        """
+        max_speed = self.waypoint_speeds[next_waypoint]
+
+        if self.red_light_waypoint > 0:
+            # u = speed at next waypoint  0 = speed at traffic light waypoint a = acceleration
+            # s = distance between next waypoint and traffic light waypoint 
+            # then, u = sqrt(-2 * a * s)
+            stopping_distance = self.distance(self.waypoints_stamped.waypoints, next_waypoint, self.red_light_waypoint)
+            if stopping_distance > SAFE_DIST:
+                stopping_distance -= SAFE_DIST
+            trajectory_target_speed = min(self.current_speed, min(max_speed, math.sqrt(-2.0 * MIN_ACCELERATION * stopping_distance)))
+        else:
+            trajectory_target_speed = max_speed
+
+        self.trajectory_target_speed  = self.trajectory_speed_hysteresis.output(trajectory_target_speed)
+
+    def get_trajectory_speed_at_waypoint(self, waypoint):
+        """Get the expected speed at the given waypoint as per the
+           current trajectory
+        Args:
+            waypoint: index of the waypoint
+        Returns:
+            float: trajectory speed at the given waypoint
+        """
+        return self.trajectory_target_speed
 
 
 if __name__ == '__main__':
