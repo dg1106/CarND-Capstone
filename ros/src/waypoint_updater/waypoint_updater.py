@@ -60,6 +60,7 @@ class WaypointUpdater(object):
         # Base waypoints
         self.waypoints_stamped = None
 
+        # simply keeps this node from exiting until the node has been shutdown.
         rospy.spin()
 
     def pose_cb(self, msg):

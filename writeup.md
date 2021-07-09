@@ -135,10 +135,9 @@ dense_4 (Dense)               (None, 4)                 36
 Waypoint updater performs the following at each current pose update
 
 ### Find closest waypoint
-1) searching for the waypoint which has the closest 2D Euclidean distance to the current pose among the waypoint list
+1) searching for the waypoint which has the closest 2D Euclidean distance to the current pose among the waypoint list  
+   It's conducted with a KDtree algorithm. O(log n) in time complexity.
 2) transforming the closest waypoint to vehicle coordinate system in order to determine wheter it is ahead of the vehicle and advance one waypoint if found to be  behind
-3) 
-
 
 ### Calculate trajectory
 1) The target speed at the next waypoint is calculated as the expected speed (v)  
