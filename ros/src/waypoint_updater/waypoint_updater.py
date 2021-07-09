@@ -68,8 +68,8 @@ class WaypointUpdater(object):
         # rospy.loginfo("waypoint_updater:pose_cb:self.pose_stamped %s", self.pose_stamped)
 
         # Do nothing until all messages have been recieved
-        if self.waypoints_stamped == None or self.red_light_waypoint == None or self.current_speed == None:
-            return
+        #if self.waypoints_stamped == None or self.red_light_waypoint == None or self.current_speed == None:
+        #    return
 
         # Find the closest waypoint to the current pose
         next_waypoint = self.get_closest_waypoint(self.pose_stamped.pose)
