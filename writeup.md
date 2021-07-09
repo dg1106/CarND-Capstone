@@ -15,11 +15,13 @@ I developed software to guide a real self-driving car around a test track. Using
 
 ### Traffic Light Detector and Classifier
 Car receives image from the camera, system can detect and classify a traffic light color.  
-First part, is to detect a traffic light and Second part, is to classify a color of the detected image. If the traffic light is not detected, the component returns "None" for traffic light.
+First part, is to detect a traffic light and Second part, is to classify a color of the detected image. If the traffic light is not detected, the component returns "None" for traffic light.  
+For knowing the detail about the learning model, please refer to github link [Traffic Light Detector and Classifier](https://github.com/dg1106/CarND-Traffic-Light-Detector-Classifier).  
 
 #### Traffic Light Detector
 This project is aimed at detecting traffic light on the incoming image from Carla.
 I've used [UNet Architecture](https://lmb.informatik.uni-freiburg.de/people/ronneber/u-net/) and applied Loss function based on [dice coefficient](https://towardsdatascience.com/metrics-to-evaluate-your-semantic-segmentation-model-6bcb99639aa2).
+
 I've used a pre-trained model that looks like below:
 
 ```bash
